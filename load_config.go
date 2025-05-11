@@ -2,145 +2,107 @@ package konfig
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strconv"
-	"time"
+	"reflect"
+	"strings"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func (c *Client) loadAll(ctx context.Context,
-	defaultsInt map[string]int,
-	defaultsUint map[string]uint,
-	defaultsStr map[string]string,
-	defaultsBool map[string]bool,
-	defaultsDuration map[string]time.Duration,
-) error {
-	validKeys := c.collectValidKeys(defaultsInt, defaultsUint, defaultsStr, defaultsBool, defaultsDuration)
-
-	if err := c.uploadDefaults(ctx, defaultsInt, defaultsUint, defaultsStr, defaultsBool, defaultsDuration); err != nil {
+// syncWithDefaults синхронизирует etcd со значениями по умолчанию из структуры
+func (rtc *RealTimeConfig) syncWithDefaults(ctx context.Context) error {
+	current, err := rtc.getCurrentValues(ctx)
+	if err != nil {
 		return err
 	}
 
-	resp, err := c.cli.Get(ctx, c.prefix, clientv3.WithPrefix())
-	if err != nil {
-		return fmt.Errorf("etcd get: %w", err)
+	defaults := rtc.getDefaultValues()
+
+	return rtc.applySync(ctx, defaults, current)
+}
+
+// getDefaultValues извлекает значения по умолчанию из структуры
+func (rtc *RealTimeConfig) getDefaultValues() map[ConfigName]any {
+	defaults := make(map[ConfigName]any)
+	v := reflect.ValueOf(rtc.cfg).Elem()
+
+	for name, field := range rtc.schema {
+		defaults[name] = v.Field(field.FieldIdx).Interface()
 	}
 
+	return defaults
+}
+
+// getCurrentValues получает текущие значения из etcd
+func (rtc *RealTimeConfig) getCurrentValues(ctx context.Context) (map[ConfigName][]byte, error) {
+	resp, err := rtc.client.Get(ctx, rtc.prefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("etcd get failed: %w", err)
+	}
+
+	values := make(map[ConfigName][]byte)
 	for _, kv := range resp.Kvs {
-		name := string(kv.Key[len(c.prefix):])
-		raw := string(kv.Value)
-
-		if _, ok := validKeys[name]; !ok {
-			_, _ = c.cli.Delete(ctx, c.prefix+name)
-			continue
-		}
-
-		c.updateCacheValue(name, raw)
+		key := strings.TrimPrefix(string(kv.Key), rtc.prefix+"/")
+		values[ConfigName(key)] = kv.Value
 	}
 
-	return nil
+	return values, nil
 }
 
-func (c *Client) collectValidKeys(
-	ints map[string]int,
-	uints map[string]uint,
-	strs map[string]string,
-	bools map[string]bool,
-	durations map[string]time.Duration,
-) map[string]struct{} {
-	keys := make(map[string]struct{})
-	for k := range ints {
-		keys[k] = struct{}{}
-	}
-	for k := range uints {
-		keys[k] = struct{}{}
-	}
-	for k := range strs {
-		keys[k] = struct{}{}
-	}
-	for k := range bools {
-		keys[k] = struct{}{}
-	}
-	for k := range durations {
-		keys[k] = struct{}{}
-	}
-	return keys
-}
+func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigName]any, current map[ConfigName][]byte) error {
+	txn := rtc.client.Txn(ctx)
 
-func (c *Client) uploadDefaults(
-	ctx context.Context,
-	ints map[string]int,
-	uints map[string]uint,
-	strs map[string]string,
-	bools map[string]bool,
-	durations map[string]time.Duration,
-) error {
-	for k, v := range ints {
-		if err := c.putIfMissing(ctx, k, strconv.Itoa(v)); err != nil {
-			return err
-		}
-	}
-	for k, v := range uints {
-		if err := c.putIfMissing(ctx, k, strconv.FormatUint(uint64(v), 10)); err != nil {
-			return err
-		}
-	}
-	for k, v := range strs {
-		if err := c.putIfMissing(ctx, k, v); err != nil {
-			return err
-		}
-	}
-	for k, v := range bools {
-		if err := c.putIfMissing(ctx, k, strconv.FormatBool(v)); err != nil {
-			return err
-		}
-	}
-	for k, v := range durations {
-		if err := c.putIfMissing(ctx, k, v.String()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+	var putOps []clientv3.Op
+	for name, defVal := range defaults {
+		if _, exists := current[name]; !exists {
+			value, err := json.Marshal(defVal)
+			if err != nil {
+				return fmt.Errorf("marshal error: %w", err)
+			}
 
-func (c *Client) putIfMissing(ctx context.Context, name, value string) error {
-	key := c.prefix + name
-	resp, err := c.cli.Get(ctx, key)
+			putOps = append(putOps, clientv3.OpPut(rtc.prefix+"/"+string(name), string(value)))
+		}
+	}
+
+	var delOps []clientv3.Op
+	for name := range current {
+		if _, exists := rtc.schema[name]; !exists {
+			delOps = append(delOps, clientv3.OpDelete(rtc.prefix+"/"+string(name)))
+		}
+	}
+
+	if len(putOps) == 0 && len(delOps) == 0 {
+		return nil
+	}
+
+	var ops []clientv3.Op
+	ops = append(ops, putOps...)
+	ops = append(ops, delOps...)
+
+	txnResp, err := txn.Then(ops...).Commit()
 	if err != nil {
-		return fmt.Errorf("get before put: %w", err)
+		return fmt.Errorf("sync transaction failed: %w", err)
 	}
-	if len(resp.Kvs) == 0 {
-		_, err = c.cli.Put(ctx, key, value)
-		if err != nil {
-			return fmt.Errorf("put key %s: %w", key, err)
-		}
+	if !txnResp.Succeeded {
+		return fmt.Errorf("sync transaction conflict")
 	}
+
 	return nil
 }
 
-func (c *Client) updateCacheValue(name, raw string) {
-	if _, ok := c.intMap[name]; ok {
-		if v, err := strconv.Atoi(raw); err == nil {
-			c.intMap[name] = v
+// encodeValue преобразует значение в строку для хранения в etcd
+func (rtc *RealTimeConfig) encodeValue(value any) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	default:
+		jsonVal, err := json.Marshal(value)
+		if err != nil {
+			return "", err
 		}
-	}
-	if _, ok := c.uintMap[name]; ok {
-		if v, err := strconv.ParseUint(raw, 10, 0); err == nil {
-			c.uintMap[name] = uint(v)
-		}
-	}
-	if _, ok := c.boolMap[name]; ok {
-		if v, err := strconv.ParseBool(raw); err == nil {
-			c.boolMap[name] = v
-		}
-	}
-	if _, ok := c.durationMap[name]; ok {
-		if v, err := time.ParseDuration(raw); err == nil {
-			c.durationMap[name] = v
-		}
-	}
-	if _, ok := c.strMap[name]; ok {
-		c.strMap[name] = raw
+		return string(jsonVal), nil
 	}
 }
