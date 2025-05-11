@@ -2,122 +2,127 @@ package konfig
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"time"
+	"reflect"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 )
 
-type RealTimeConfig interface {
-	GetInt(name string) (int, bool)
-	GetUint(name string) (uint, bool)
-	GetString(name string) (string, bool)
-	GetBool(name string) (bool, bool)
+var (
+	ErrWrongType = errors.New("cfg must be a pointer to struct")
+)
+
+type Config interface {
 	Close() error
 }
 
-// Client ...
-type Client struct {
-	cli    *clientv3.Client
+type ConfigName string
+
+type fieldSchema struct {
+	Type     reflect.Type
+	FieldIdx int
+}
+
+type RealTimeConfig struct {
+	client *clientv3.Client
 	prefix string
-
-	intMap      map[string]int
-	uintMap     map[string]uint
-	strMap      map[string]string
-	boolMap     map[string]bool
-	durationMap map[string]time.Duration
+	schema map[ConfigName]fieldSchema
+	cfg    any // указатель на структуру
 }
 
-// Options — параметры для подключения к etcd
-type Options struct {
-	Endpoints   []string
-	Prefix      string
-	DialTimeout time.Duration
-	Zap         *zap.Logger
-}
-
-// NewConfigClient создаёт клиента, заполняя дефолты и запуская watch.
-// defaultsInt, defaultsUint, defaultsStr, defaultsBool, defaultsDuration — соответствующие мапы
-func NewConfigClient(ctx context.Context, opts Options,
-	defaultsInt map[string]int,
-	defaultsUint map[string]uint,
-	defaultsStr map[string]string,
-	defaultsBool map[string]bool,
-	defaultsDuration map[string]time.Duration,
-) (*Client, error) {
-	if opts.DialTimeout == 0 {
-		opts.DialTimeout = 5 * time.Second
+func NewRealTimeConfig(ctx context.Context, cli *clientv3.Client, prefix string, cfg any) (*RealTimeConfig, error) {
+	t := reflect.TypeOf(cfg)
+	if t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Struct {
+		return nil, ErrWrongType
 	}
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   opts.Endpoints,
-		DialTimeout: opts.DialTimeout,
-		Logger:      opts.Zap,
-	})
+
+	schema, err := buildSchema(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("etcd connect: %w", err)
-	}
-
-	c := &Client{
-		cli:         cli,
-		prefix:      opts.Prefix,
-		intMap:      make(map[string]int),
-		uintMap:     make(map[string]uint),
-		strMap:      make(map[string]string),
-		boolMap:     make(map[string]bool),
-		durationMap: make(map[string]time.Duration),
-	}
-
-	for k, v := range defaultsInt {
-		c.intMap[k] = v
-	}
-	for k, v := range defaultsUint {
-		c.uintMap[k] = v
-	}
-	for k, v := range defaultsStr {
-		c.strMap[k] = v
-	}
-	for k, v := range defaultsBool {
-		c.boolMap[k] = v
-	}
-	for k, v := range defaultsDuration {
-		c.durationMap[k] = v
-	}
-
-	if err = c.loadAll(ctx, defaultsInt, defaultsUint, defaultsStr, defaultsBool, defaultsDuration); err != nil {
 		return nil, err
 	}
 
-	go c.watch(ctx)
+	rtc := &RealTimeConfig{
+		client: cli,
+		prefix: prefix,
+		schema: schema,
+		cfg:    cfg,
+	}
 
-	return c, nil
+	if err = rtc.syncWithDefaults(ctx); err != nil {
+		return nil, err
+	}
+
+	go rtc.watch(ctx)
+
+	return rtc, nil
 }
 
-// GetInt возвращает int-значение
-func (c *Client) GetInt(name string) (int, bool) {
-	v, ok := c.intMap[name]
-	return v, ok
+func (rtc *RealTimeConfig) Get(ctx context.Context, name ConfigName) (any, error) {
+	meta, ok := rtc.schema[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown config field: %s", name)
+	}
+
+	key := rtc.prefix + "/" + string(name)
+	resp, err := rtc.client.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("etcd get failed: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, fmt.Errorf("key not found in etcd: %s", key)
+	}
+
+	ptr := reflect.New(meta.Type)
+	if err = json.Unmarshal(resp.Kvs[0].Value, ptr.Interface()); err != nil {
+		return nil, fmt.Errorf("unmarshal failed: %w", err)
+	}
+
+	return ptr.Elem().Interface(), nil
 }
 
-// GetUint возвращает uint-значение
-func (c *Client) GetUint(name string) (uint, bool) {
-	v, ok := c.uintMap[name]
-	return v, ok
+func (rtc *RealTimeConfig) Set(ctx context.Context, name ConfigName, value any) error {
+	meta, ok := rtc.schema[name]
+	if !ok {
+		return fmt.Errorf("unknown config field: %s", name)
+	}
+
+	val := reflect.ValueOf(value)
+	if val.Type() != meta.Type {
+		return fmt.Errorf("invalid type for field %s: expected %s, got %s", name, meta.Type, val.Type())
+	}
+
+	ptr := reflect.ValueOf(rtc.cfg)
+	structVal := ptr.Elem()
+	structVal.Field(meta.FieldIdx).Set(val)
+
+	key := rtc.prefix + "/" + string(name)
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal error: %w", err)
+	}
+
+	_, err = rtc.client.Put(ctx, key, string(data))
+	return err
 }
 
-// GetString возвращает string-значение
-func (c *Client) GetString(name string) (string, bool) {
-	v, ok := c.strMap[name]
-	return v, ok
-}
+func buildSchema(cfg any) (map[ConfigName]fieldSchema, error) {
+	schema := make(map[ConfigName]fieldSchema)
+	t := reflect.TypeOf(cfg).Elem()
 
-// GetBool возвращает bool-значение
-func (c *Client) GetBool(name string) (bool, bool) {
-	v, ok := c.boolMap[name]
-	return v, ok
-}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		etcdName := field.Tag.Get("etcd")
+		if etcdName == "" {
+			return nil, fmt.Errorf("field %s is missing etcd tag", field.Name)
+		}
 
-// Close закрывает соединение с etcd
-func (c *Client) Close() error {
-	return c.cli.Close()
+		schema[ConfigName(etcdName)] = fieldSchema{
+			Type:     field.Type,
+			FieldIdx: i,
+		}
+	}
+
+	return schema, nil
 }
