@@ -1,0 +1,6 @@
+go.sum linguist-generated -diff -text linguist-generated=true
+
+*_mock.go -diff -text linguist-generated=true
+**/*_mock.go -diff -text linguist-generated=true
+
+README.md -diff -text linguist-generated=true
