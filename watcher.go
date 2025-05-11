@@ -10,7 +10,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// watch отслеживание изменений, обновление кеша
+// watch отслеживание изменений
 func (rtc *RealTimeConfig) watch(ctx context.Context) {
 	rch := rtc.client.Watch(ctx, rtc.prefix, clientv3.WithPrefix())
 
@@ -19,11 +19,7 @@ func (rtc *RealTimeConfig) watch(ctx context.Context) {
 			switch ev.Type {
 			case clientv3.EventTypePut:
 				name := strings.TrimPrefix(string(ev.Kv.Key), rtc.prefix+"/")
-				field, ok := rtc.schema[ConfigName(name)]
-				if !ok {
-					continue
-				}
-
+				field := rtc.schema[ConfigName(name)]
 				targetVal := reflect.New(field.Type).Interface()
 
 				if err := json.Unmarshal(ev.Kv.Value, targetVal); err != nil {

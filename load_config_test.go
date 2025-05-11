@@ -12,6 +12,8 @@ import (
 )
 
 func TestRealTimeConfig_Sync(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"localhost:2379"},
@@ -81,6 +83,7 @@ func TestRealTimeConfig_Sync(t *testing.T) {
 }
 
 func TestRealTimeConfig_ConcurrentSync(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"localhost:2379"},
@@ -126,6 +129,7 @@ func TestRealTimeConfig_ConcurrentSync(t *testing.T) {
 }
 
 func TestRealTimeConfig_ComplexTypes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"localhost:2379"},
