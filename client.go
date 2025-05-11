@@ -14,10 +14,6 @@ var (
 	ErrWrongType = errors.New("cfg must be a pointer to struct")
 )
 
-type Config interface {
-	Close() error
-}
-
 type ConfigName string
 
 type fieldSchema struct {
@@ -29,7 +25,7 @@ type RealTimeConfig struct {
 	client *clientv3.Client
 	prefix string
 	schema map[ConfigName]fieldSchema
-	cfg    any // указатель на структуру
+	cfg    any
 }
 
 func NewRealTimeConfig(ctx context.Context, cli *clientv3.Client, prefix string, cfg any) (*RealTimeConfig, error) {
