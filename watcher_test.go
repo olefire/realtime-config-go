@@ -12,9 +12,9 @@ import (
 )
 
 func TestWatch(t *testing.T) {
-	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	ctx := context.Background()
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"localhost:2379"},
 		DialTimeout: 2 * time.Second,
@@ -57,6 +57,8 @@ func TestWatch(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return cfg.Value == 100
 	}, time.Second, 100*time.Millisecond, "Config value should be updated again")
+
+	cancel()
 
 	done := make(chan struct{})
 	go func() {

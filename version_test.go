@@ -16,7 +16,6 @@ const (
 )
 
 func TestRealTimeConfigHistory(t *testing.T) {
-	t.Parallel()
 
 	ctx := context.Background()
 	client, err := clientv3.New(clientv3.Config{

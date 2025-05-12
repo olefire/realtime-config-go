@@ -19,7 +19,10 @@ func (rtc *RealTimeConfig) watch(ctx context.Context) {
 			switch ev.Type {
 			case clientv3.EventTypePut:
 				name := strings.TrimPrefix(string(ev.Kv.Key), rtc.prefix+"/")
-				field := rtc.schema[ConfigName(name)]
+				field, ok := rtc.schema[ConfigName(name)]
+				if !ok {
+					continue
+				}
 				targetVal := reflect.New(field.Type).Interface()
 
 				if err := json.Unmarshal(ev.Kv.Value, targetVal); err != nil {
@@ -42,7 +45,7 @@ func (rtc *RealTimeConfig) watch(ctx context.Context) {
 					}
 					fieldValue.Set(newMap)
 				default:
-					fieldValue.Set(valToSet)
+					fieldValue.Set(reflect.Indirect(reflect.ValueOf(targetVal)))
 				}
 			}
 		}

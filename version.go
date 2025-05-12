@@ -15,7 +15,7 @@ var (
 	ErrRevisionNotFound = errors.New("revision not found")
 )
 
-// HistoryEntry представляет одну версию изменения конфига
+// HistoryEntry представляет ревизию поля конфига
 type HistoryEntry struct {
 	Revision int64       `json:"revision"`
 	Key      string      `json:"key"`
