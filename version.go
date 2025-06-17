@@ -17,39 +17,23 @@ var (
 
 // HistoryEntry представляет ревизию поля конфига
 type HistoryEntry struct {
-	Revision int64       `json:"revision"`
-	Key      string      `json:"key"`
-	Value    interface{} `json:"value"`
+	Revision  int64       `json:"revision"`
+	Key       string      `json:"key"`
+	Value     interface{} `json:"value"`
+	CreateRev int64       `json:"create_rev"`
+	ModRev    int64       `json:"mod_rev"`
+	Version   int64       `json:"version"`
 }
 
 // GetHistory возвращает историю изменений для всех ключей
 func (rtc *RealTimeConfig) GetHistory(ctx context.Context, fromRev int64, limit int64) ([]HistoryEntry, error) {
-	resp, err := rtc.client.Get(ctx, rtc.prefix,
-		clientv3.WithPrefix(),
-		clientv3.WithRev(fromRev),
-		clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortDescend),
-		clientv3.WithLimit(limit),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("etcd get history failed: %w", err)
-	}
-
-	return rtc.parseHistoryResponse(resp)
+	return rtc.getKeyHistory(ctx, rtc.prefix, fromRev, limit)
 }
 
 // GetKeyHistory возвращает историю изменений для конкретного ключа
 func (rtc *RealTimeConfig) GetKeyHistory(ctx context.Context, key string, fromRev int64, limit int64) ([]HistoryEntry, error) {
 	fullKey := rtc.prefix + "/" + key
-	resp, err := rtc.client.Get(ctx, fullKey,
-		clientv3.WithRev(fromRev),
-		clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortDescend),
-		clientv3.WithLimit(limit),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("etcd get key history failed: %w", err)
-	}
-
-	return rtc.parseHistoryResponse(resp)
+	return rtc.getKeyHistory(ctx, fullKey, fromRev, limit)
 }
 
 func (rtc *RealTimeConfig) parseHistoryResponse(resp *clientv3.GetResponse) ([]HistoryEntry, error) {
@@ -95,4 +79,66 @@ func (rtc *RealTimeConfig) RollbackConfig(ctx context.Context, rev int64) error 
 	}
 
 	return nil
+}
+
+func (rtc *RealTimeConfig) getKeyHistory(ctx context.Context, prefix string, fromRev int64, limit int64) ([]HistoryEntry, error) {
+	resp, err := rtc.client.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("etcd get prefix failed: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, nil
+	}
+
+	var allEntries []HistoryEntry
+
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		modRev := kv.ModRevision
+		createRev := kv.CreateRevision
+
+		startRev := modRev
+		if fromRev > 0 && fromRev < modRev {
+			startRev = fromRev
+		}
+		if startRev < createRev {
+			startRev = createRev
+		}
+
+		for rev := startRev; rev >= createRev; rev-- {
+			entry, err := rtc.getRevAsEntry(ctx, key, rev)
+			if err != nil {
+				return nil, err
+			}
+			if entry != nil {
+				allEntries = append(allEntries, *entry)
+			}
+		}
+	}
+
+	if limit > 0 && int64(len(allEntries)) > limit {
+		allEntries = allEntries[:limit]
+	}
+
+	return allEntries, nil
+}
+
+func (rtc *RealTimeConfig) getRevAsEntry(ctx context.Context, key string, rev int64) (*HistoryEntry, error) {
+	resp, err := rtc.client.Get(ctx, key, clientv3.WithRev(rev))
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, nil
+	}
+
+	kv := resp.Kvs[0]
+	return &HistoryEntry{
+		Key:       string(kv.Key),
+		Value:     string(kv.Value),
+		Revision:  resp.Header.Revision,
+		CreateRev: kv.CreateRevision,
+		ModRev:    kv.ModRevision,
+		Version:   kv.Version,
+	}, nil
 }
