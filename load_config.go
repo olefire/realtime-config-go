@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -52,16 +53,51 @@ func (rtc *RealTimeConfig) getCurrentValues(ctx context.Context) (map[ConfigName
 
 func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigName]any, current map[ConfigName][]byte) error {
 	txn := rtc.client.Txn(ctx)
+	cfgValue := reflect.ValueOf(rtc.cfg).Elem()
 
 	var putOps []clientv3.Op
+
+	for name, currentValBytes := range current {
+		field, ok := rtc.schema[name]
+		if !ok {
+			continue
+		}
+
+		var etcdVal any
+		if err := json.Unmarshal(currentValBytes, &etcdVal); err != nil {
+			return fmt.Errorf("unmarshal error for %s: %w", name, err)
+		}
+
+		fieldValue := cfgValue.Field(field.FieldIdx)
+		currentCfgVal := fieldValue.Interface()
+
+		convertedVal, err := convertType(etcdVal, fieldValue.Type())
+		if err != nil {
+			return fmt.Errorf("type conversion failed for %s: %w", name, err)
+		}
+
+		if !reflect.DeepEqual(currentCfgVal, convertedVal) {
+			fieldValue.Set(reflect.ValueOf(convertedVal))
+		}
+	}
+
 	for name, defVal := range defaults {
 		if _, exists := current[name]; !exists {
-			value, err := json.Marshal(defVal)
-			if err != nil {
-				return fmt.Errorf("marshal error: %w", err)
-			}
+			if field, ok := rtc.schema[name]; ok {
+				fieldValue := cfgValue.Field(field.FieldIdx)
+				convertedVal, err := convertType(defVal, fieldValue.Type())
+				if err != nil {
+					return fmt.Errorf("type conversion failed for default %s: %w", name, err)
+				}
 
-			putOps = append(putOps, clientv3.OpPut(rtc.prefix+"/"+string(name), string(value)))
+				fieldValue.Set(reflect.ValueOf(convertedVal))
+
+				value, err := json.Marshal(defVal)
+				if err != nil {
+					return fmt.Errorf("marshal error: %w", err)
+				}
+				putOps = append(putOps, clientv3.OpPut(rtc.prefix+"/"+string(name), string(value)))
+			}
 		}
 	}
 
@@ -72,23 +108,45 @@ func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigNam
 		}
 	}
 
-	if len(putOps) == 0 && len(delOps) == 0 {
-		return nil
-	}
+	if len(putOps) > 0 || len(delOps) > 0 {
+		var ops []clientv3.Op
+		ops = append(ops, putOps...)
+		ops = append(ops, delOps...)
 
-	var ops []clientv3.Op
-	ops = append(ops, putOps...)
-	ops = append(ops, delOps...)
-
-	txnResp, err := txn.Then(ops...).Commit()
-	if err != nil {
-		return fmt.Errorf("sync transaction failed: %w", err)
-	}
-	if !txnResp.Succeeded {
-		return fmt.Errorf("sync transaction conflict")
+		txnResp, err := txn.Then(ops...).Commit()
+		if err != nil {
+			return fmt.Errorf("sync transaction failed: %w", err)
+		}
+		if !txnResp.Succeeded {
+			return fmt.Errorf("sync transaction conflict")
+		}
 	}
 
 	return nil
+}
+
+// convertType преобразует значение в целевой тип
+func convertType(val any, targetType reflect.Type) (any, error) {
+	sourceVal := reflect.ValueOf(val)
+
+	if targetType == reflect.TypeOf(time.Duration(0)) {
+		switch v := val.(type) {
+		case float64:
+			return time.Duration(v), nil
+		case string:
+			return time.ParseDuration(v)
+		case int, int64:
+			return time.Duration(reflect.ValueOf(v).Int()), nil
+		default:
+			return nil, fmt.Errorf("cannot convert %T to time.Duration", val)
+		}
+	}
+
+	if sourceVal.CanConvert(targetType) {
+		return sourceVal.Convert(targetType).Interface(), nil
+	}
+
+	return nil, fmt.Errorf("cannot convert %T to %v", val, targetType)
 }
 
 // encodeValue преобразует значение в строку для хранения в etcd

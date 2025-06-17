@@ -17,7 +17,6 @@ var (
 
 // HistoryEntry представляет ревизию поля конфига
 type HistoryEntry struct {
-	Revision  int64       `json:"revision"`
 	Key       string      `json:"key"`
 	Value     interface{} `json:"value"`
 	CreateRev int64       `json:"create_rev"`
@@ -64,7 +63,6 @@ func (rtc *RealTimeConfig) GetHistoryByRevisions(ctx context.Context, fromRev, t
 			entries = append(entries, HistoryEntry{
 				Key:       key,
 				Value:     string(kv.Value),
-				Revision:  resp.Header.Revision,
 				CreateRev: kv.CreateRevision,
 				ModRev:    kv.ModRevision,
 				Version:   kv.Version,
@@ -103,9 +101,8 @@ func (rtc *RealTimeConfig) parseHistoryResponse(resp *clientv3.GetResponse) ([]H
 		}
 
 		history = append(history, HistoryEntry{
-			Revision: kv.ModRevision,
-			Key:      string(name),
-			Value:    ptr.Elem().Interface(),
+			Key:   string(name),
+			Value: ptr.Elem().Interface(),
 		})
 	}
 
@@ -185,7 +182,6 @@ func (rtc *RealTimeConfig) getRevAsEntry(ctx context.Context, key string, rev in
 	return &HistoryEntry{
 		Key:       string(kv.Key),
 		Value:     string(kv.Value),
-		Revision:  resp.Header.Revision,
 		CreateRev: kv.CreateRevision,
 		ModRev:    kv.ModRevision,
 		Version:   kv.Version,
