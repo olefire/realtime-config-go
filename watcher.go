@@ -23,15 +23,21 @@ func (rtc *RealTimeConfig) watch(ctx context.Context) {
 				if !ok {
 					continue
 				}
-				targetVal := reflect.New(field.Type).Interface()
 
-				if err := json.Unmarshal(ev.Kv.Value, targetVal); err != nil {
+				var rawVal any
+				if err := json.Unmarshal(ev.Kv.Value, &rawVal); err != nil {
 					log.Printf("Failed to unmarshal value for %s: %v", name, err)
 					continue
 				}
 
+				convertedVal, err := convertType(rawVal, field.Type)
+				if err != nil {
+					log.Printf("Type conversion failed for %s: %v", name, err)
+					continue
+				}
+
 				fieldValue := reflect.ValueOf(rtc.cfg).Elem().Field(field.FieldIdx)
-				valToSet := reflect.ValueOf(targetVal).Elem()
+				valToSet := reflect.ValueOf(convertedVal)
 
 				switch fieldValue.Kind() {
 				case reflect.Slice:
@@ -45,8 +51,10 @@ func (rtc *RealTimeConfig) watch(ctx context.Context) {
 					}
 					fieldValue.Set(newMap)
 				default:
-					fieldValue.Set(reflect.Indirect(reflect.ValueOf(targetVal)))
+					fieldValue.Set(valToSet)
 				}
+
+				log.Printf("Config updated: %s = %v", name, convertedVal)
 			}
 		}
 	}

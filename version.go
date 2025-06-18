@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -27,54 +28,6 @@ type HistoryEntry struct {
 // GetHistory возвращает историю изменений для всех ключей
 func (rtc *RealTimeConfig) GetHistory(ctx context.Context, fromRev int64, limit int64) ([]HistoryEntry, error) {
 	return rtc.getKeyHistory(ctx, rtc.prefix, fromRev, limit)
-}
-
-func (rtc *RealTimeConfig) GetHistoryByRevisions(ctx context.Context, fromRev, toRev, limit int64) ([]HistoryEntry, error) {
-	if toRev == 0 {
-		resp, err := rtc.client.Get(ctx, rtc.prefix, clientv3.WithPrefix())
-		if err != nil {
-			return nil, fmt.Errorf("get current revision failed: %w", err)
-		}
-		toRev = resp.Header.Revision
-	}
-
-	var entries []HistoryEntry
-	seen := make(map[string]map[int64]struct{})
-
-	for rev := toRev; rev >= fromRev; rev-- {
-		resp, err := rtc.client.Get(ctx, rtc.prefix,
-			clientv3.WithPrefix(),
-			clientv3.WithRev(rev),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("get at revision %d failed: %w", rev, err)
-		}
-
-		for _, kv := range resp.Kvs {
-			key := string(kv.Key)
-			if _, ok := seen[key]; !ok {
-				seen[key] = make(map[int64]struct{})
-			}
-			if _, duplicate := seen[key][kv.ModRevision]; duplicate {
-				continue
-			}
-			seen[key][kv.ModRevision] = struct{}{}
-
-			entries = append(entries, HistoryEntry{
-				Key:       key,
-				Value:     string(kv.Value),
-				CreateRev: kv.CreateRevision,
-				ModRev:    kv.ModRevision,
-				Version:   kv.Version,
-			})
-
-			if limit > 0 && int64(len(entries)) >= limit {
-				return entries, nil
-			}
-		}
-	}
-
-	return entries, nil
 }
 
 // GetKeyHistory возвращает историю изменений для конкретного ключа
@@ -137,6 +90,7 @@ func (rtc *RealTimeConfig) getKeyHistory(ctx context.Context, prefix string, fro
 	}
 
 	var allEntries []HistoryEntry
+	seenEntries := make(map[string]struct{})
 
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
@@ -157,10 +111,19 @@ func (rtc *RealTimeConfig) getKeyHistory(ctx context.Context, prefix string, fro
 				return nil, err
 			}
 			if entry != nil {
-				allEntries = append(allEntries, *entry)
+				entryID := fmt.Sprintf("%s@%d", entry.Key, entry.ModRev)
+
+				if _, exists := seenEntries[entryID]; !exists {
+					seenEntries[entryID] = struct{}{}
+					allEntries = append(allEntries, *entry)
+				}
 			}
 		}
 	}
+
+	sort.Slice(allEntries, func(i, j int) bool {
+		return allEntries[i].ModRev > allEntries[j].ModRev
+	})
 
 	if limit > 0 && int64(len(allEntries)) > limit {
 		allEntries = allEntries[:limit]

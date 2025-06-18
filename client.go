@@ -84,23 +84,32 @@ func (rtc *RealTimeConfig) Set(ctx context.Context, name ConfigName, value any) 
 		return fmt.Errorf("unknown config field: %s", name)
 	}
 
-	val := reflect.ValueOf(value)
-	if val.Type() != meta.Type {
-		return fmt.Errorf("invalid type for field %s: expected %s, got %s", name, meta.Type, val.Type())
+	convertedVal, err := convertType(value, meta.Type)
+	if err != nil {
+		return fmt.Errorf("type conversion failed for field %s: %w", name, err)
 	}
 
-	ptr := reflect.ValueOf(rtc.cfg)
-	structVal := ptr.Elem()
-	structVal.Field(meta.FieldIdx).Set(val)
+	val := reflect.ValueOf(convertedVal)
+	if val.Type() != meta.Type {
+		return fmt.Errorf("invalid type after conversion for field %s: expected %s, got %s",
+			name, meta.Type, val.Type())
+	}
 
 	key := rtc.prefix + "/" + string(name)
-	data, err := json.Marshal(value)
+	data, err := json.Marshal(convertedVal)
 	if err != nil {
 		return fmt.Errorf("marshal error: %w", err)
 	}
 
 	_, err = rtc.client.Put(ctx, key, string(data))
-	return err
+	if err != nil {
+		return fmt.Errorf("etcd put failed: %w", err)
+	}
+
+	fieldValue := reflect.ValueOf(rtc.cfg).Elem().Field(meta.FieldIdx)
+	fieldValue.Set(val)
+
+	return nil
 }
 
 func buildSchema(cfg any) (map[ConfigName]fieldSchema, error) {

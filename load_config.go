@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -35,17 +36,29 @@ func (rtc *RealTimeConfig) getDefaultValues() map[ConfigName]any {
 	return defaults
 }
 
-// getCurrentValues получает текущие значения из etcd
+// getCurrentValues получает последние версии значений из etcd
 func (rtc *RealTimeConfig) getCurrentValues(ctx context.Context) (map[ConfigName][]byte, error) {
-	resp, err := rtc.client.Get(ctx, rtc.prefix, clientv3.WithPrefix())
+	resp, err := rtc.client.Get(ctx, rtc.prefix,
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortDescend))
+
 	if err != nil {
 		return nil, fmt.Errorf("etcd get failed: %w", err)
 	}
 
 	values := make(map[ConfigName][]byte)
+	processedKeys := make(map[string]bool)
+
 	for _, kv := range resp.Kvs {
-		key := strings.TrimPrefix(string(kv.Key), rtc.prefix+"/")
-		values[ConfigName(key)] = kv.Value
+		key := string(kv.Key)
+		configName := ConfigName(strings.TrimPrefix(key, rtc.prefix+"/"))
+
+		if processedKeys[key] {
+			continue
+		}
+		processedKeys[key] = true
+
+		values[configName] = kv.Value
 	}
 
 	return values, nil
@@ -54,7 +67,7 @@ func (rtc *RealTimeConfig) getCurrentValues(ctx context.Context) (map[ConfigName
 func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigName]any, current map[ConfigName][]byte) error {
 	txn := rtc.client.Txn(ctx)
 	cfgValue := reflect.ValueOf(rtc.cfg).Elem()
-
+	fmt.Println(current)
 	var putOps []clientv3.Op
 
 	for name, currentValBytes := range current {
@@ -67,6 +80,7 @@ func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigNam
 		if err := json.Unmarshal(currentValBytes, &etcdVal); err != nil {
 			return fmt.Errorf("unmarshal error for %s: %w", name, err)
 		}
+		fmt.Println(etcdVal)
 
 		fieldValue := cfgValue.Field(field.FieldIdx)
 		currentCfgVal := fieldValue.Interface()
@@ -75,9 +89,9 @@ func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigNam
 		if err != nil {
 			return fmt.Errorf("type conversion failed for %s: %w", name, err)
 		}
-
 		if !reflect.DeepEqual(currentCfgVal, convertedVal) {
 			fieldValue.Set(reflect.ValueOf(convertedVal))
+			log.Println(rtc.cfg)
 		}
 	}
 
@@ -125,9 +139,31 @@ func (rtc *RealTimeConfig) applySync(ctx context.Context, defaults map[ConfigNam
 	return nil
 }
 
-// convertType преобразует значение в целевой тип
 func convertType(val any, targetType reflect.Type) (any, error) {
 	sourceVal := reflect.ValueOf(val)
+	if targetType == reflect.TypeOf(map[string]struct{}{}) {
+		if m, ok := val.(map[string]interface{}); ok {
+			result := make(map[string]struct{})
+			for k := range m {
+				result[k] = struct{}{}
+			}
+			return result, nil
+		}
+	}
+
+	if targetType == reflect.TypeOf(map[string]int{}) {
+		if m, ok := val.(map[string]interface{}); ok {
+			result := make(map[string]int)
+			for k, v := range m {
+				if f, ok := v.(float64); ok {
+					result[k] = int(f)
+				} else {
+					return nil, fmt.Errorf("cannot convert map value %v to int", v)
+				}
+			}
+			return result, nil
+		}
+	}
 
 	if targetType == reflect.TypeOf(time.Duration(0)) {
 		switch v := val.(type) {
