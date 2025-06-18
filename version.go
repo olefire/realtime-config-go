@@ -14,6 +14,8 @@ import (
 
 var (
 	ErrRevisionNotFound = errors.New("revision not found")
+	ErrKeyNotFound      = errors.New("key not found")
+	ErrVersionNotFound  = errors.New("version not found")
 )
 
 // HistoryEntry представляет ревизию поля конфига
@@ -62,22 +64,95 @@ func (rtc *RealTimeConfig) parseHistoryResponse(resp *clientv3.GetResponse) ([]H
 	return history, nil
 }
 
-// RollbackConfig откатывает конфиг к указанной ревизии
-func (rtc *RealTimeConfig) RollbackConfig(ctx context.Context, rev int64) error {
-	history, err := rtc.GetHistory(ctx, rev, 1)
+// RollbackKeyByRevision откатывает значение ключа к указанной ревизии
+func (rtc *RealTimeConfig) RollbackKeyByRevision(ctx context.Context, key ConfigName, revision int64) error {
+	fullKey := rtc.prefix + "/" + string(key)
+
+	histResp, err := rtc.client.Get(ctx, fullKey, clientv3.WithRev(revision))
 	if err != nil {
-		return err
+		return fmt.Errorf("etcd get at revision %d for key %s failed: %w", revision, key, err)
+	}
+	if len(histResp.Kvs) == 0 {
+		return fmt.Errorf("%w: revision %d not found for key %s", ErrRevisionNotFound, revision, key)
 	}
 
-	if len(history) == 0 {
-		return ErrRevisionNotFound
+	histKV := histResp.Kvs[0]
+
+	field, ok := rtc.schema[key]
+	if !ok {
+		return fmt.Errorf("field metadata for key %s not found", key)
 	}
 
-	if err = rtc.Set(ctx, ConfigName(history[0].Key), history[0].Value); err != nil {
-		return fmt.Errorf("rollback failed for key %s: %w", history[0].Key, err)
+	var rawVal any
+	if err = json.Unmarshal(histKV.Value, &rawVal); err != nil {
+		return fmt.Errorf("failed to unmarshal value for key %s at revision %d: %w", key, revision, err)
+	}
+
+	convertedVal, err := convertType(rawVal, field.Type)
+	if err != nil {
+		return fmt.Errorf("type conversion failed for field %s: %w", key, err)
+	}
+
+	if err = rtc.Set(ctx, key, convertedVal); err != nil {
+		return fmt.Errorf("rollback to revision %d failed for key %s: %w", revision, key, err)
 	}
 
 	return nil
+}
+
+// RollbackKeyByVersion откатывает конфиг к указанной версии
+func (rtc *RealTimeConfig) RollbackKeyByVersion(ctx context.Context, key ConfigName, version int64) error {
+	fullKey := rtc.prefix + "/" + string(key)
+
+	getResp, err := rtc.client.Get(ctx, fullKey)
+	if err != nil {
+		return fmt.Errorf("etcd get failed for key %s: %w", key, err)
+	}
+	if len(getResp.Kvs) == 0 {
+		return fmt.Errorf("%w: key %s not found", ErrKeyNotFound, key)
+	}
+
+	kv := getResp.Kvs[0]
+	modRev := kv.ModRevision
+	createRev := kv.CreateRevision
+
+	field, ok := rtc.schema[key]
+	if !ok {
+		return fmt.Errorf("field metadata for key %s not found", key)
+	}
+
+	for rev := modRev; rev >= createRev; rev-- {
+		histResp, err := rtc.client.Get(ctx, fullKey, clientv3.WithRev(rev))
+		if err != nil {
+			return fmt.Errorf("etcd get rev %d for key %s failed: %w", rev, key, err)
+		}
+		if len(histResp.Kvs) == 0 {
+			continue
+		}
+
+		histKV := histResp.Kvs[0]
+		if histKV.Version != version {
+			continue
+		}
+
+		var rawVal any
+		if err := json.Unmarshal(histKV.Value, &rawVal); err != nil {
+			return fmt.Errorf("failed to unmarshal value for key %s: %w", key, err)
+		}
+
+		convertedVal, err := convertType(rawVal, field.Type)
+		if err != nil {
+			return fmt.Errorf("type conversion failed for field %s: %w", key, err)
+		}
+
+		if err = rtc.Set(ctx, key, convertedVal); err != nil {
+			return fmt.Errorf("rollback failed for key %s: %w", key, err)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("%w: version %d not found for key %s", ErrVersionNotFound, version, key)
 }
 
 func (rtc *RealTimeConfig) getKeyHistory(ctx context.Context, prefix string, fromRev int64, limit int64) ([]HistoryEntry, error) {
